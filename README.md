@@ -115,6 +115,20 @@ FRI 07:00
 
 Lo stesso orario in più giorni diventa una sola sveglia con più bit di ripetizione.
 
+### Promemoria
+
+Tabella funzioni `02 02`, byte "altre funzioni" = `0x6b`: long_sit, lost_find, find_phone,
+config_default, up_hand_gesture.
+
+| Promemoria | Comando | Stato |
+|---|---|---|
+| Seduta prolungata | `03 20 <ora inizio> <min inizio> <ora fine> <min fine> <intervallo min u16 LE> <ripetizione u16 LE>` | **supportato**: risponde `03 20` |
+| Bere acqua | `03 60 <on> <ora inizio> <min> <ora fine> <min> <giorni> <intervallo> …` (formato dei modelli recenti) | **non supportato**: nessuna risposta |
+
+La ripetizione della seduta prolungata dovrebbe seguire lo schema delle sveglie (bit 0 = attivo,
+bit 1…7 = lunedì…domenica, come `0x3f` nel promemoria acqua dei modelli recenti): non ancora
+verificato sul dispositivo.
+
 Stato batteria: `0` normale, `1` in carica, `2` carica, `3` batteria scarica.
 Il giorno della settimana parte da **lunedì = 0**. Il tipo `0x08` è WhatsApp. In un singolo
 pacchetto mittente + numero + testo devono stare in 12 byte; testi più lunghi richiedono più
