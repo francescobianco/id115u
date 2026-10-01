@@ -6,11 +6,18 @@
 #   ./id115u time                     read band clock (02 03)
 #   ./id115u settime                  set band clock to local time (03 01)
 #   ./id115u mac                      read MAC address (02 04)
+#   ./id115u battery                  battery level, voltage, charging state (02 05)
+#   ./id115u live                     today's totals: steps, calories, distance, active time (02 a0)
+#   ./id115u activity                 today's activity in 15-minute slots (08 03 on 0af1)
+#   ./id115u find [seconds]           "find device" vibration (06 04), stopped after N s (default 5)
 #   ./id115u vibrate [seconds]        incoming-call alert, cancelled after N s (default 4)
 #   ./id115u notify <from> <text>     WhatsApp notification (from+text <= 12 bytes)
-#   ./id115u raw <hex> [<hex>...]     write raw commands (padded to 20 bytes); "sleep:N" waits
+#   ./id115u raw <hex> [<hex>...]     write raw commands (padded to 20 bytes); "sleep:N" waits,
+#                                     "read:<handle>" reads a characteristic,
+#                                     "h:<hex>" writes unpadded to the health channel 0af1
 #
-# Env: MAC (default E7:84:6B:69:A2:8A), RETRIES (default 5), CONNECT_TIMEOUT (seconds, default 20)
+# Env: KEEP_LOG=<file> saves the raw gatttool log.
+#      MAC (default E7:84:6B:69:A2:8A), RETRIES (default 5), CONNECT_TIMEOUT (seconds, default 20)
 
 set -u
 
@@ -18,11 +25,13 @@ MAC=${MAC:-E7:84:6B:69:A2:8A}
 RETRIES=${RETRIES:-5}
 CONNECT_TIMEOUT=${CONNECT_TIMEOUT:-20}
 
-WRITE_HANDLE=0x000e   # 0af6 write characteristic
-NOTIFY_CCCD=0x0011    # CCCD of 0af7 notify characteristic
+WRITE_HANDLE=0x000e   # 0af6 write characteristic (commands)
+HEALTH_HANDLE=0x0016  # 0af1 write characteristic (health data requests)
+NOTIFY_CCCD=0x0011    # CCCD of 0af7 notify characteristic (command responses)
+HEALTH_CCCD=0x0014    # CCCD of 0af2 notify characteristic (health data)
 
 WORK=$(mktemp -d)
-trap 'kill $GPID 2>/dev/null; rm -rf "$WORK"' EXIT
+trap 'kill $GPID 2>/dev/null; [[ -n ${KEEP_LOG:-} ]] && cp "$WORK/log" "$KEEP_LOG"; rm -rf "$WORK"' EXIT
 GPID=
 
 pad() { printf '%-40s' "$1" | tr ' ' 0; }
@@ -54,9 +63,14 @@ attempt() {
     return 1
   fi
   echo "char-write-req $NOTIFY_CCCD 0100" >&3; sleep 0.5
+  echo "char-write-req $HEALTH_CCCD 0100" >&3; sleep 0.5
   n=0
   for cmd in "$@"; do
     if [[ $cmd == sleep:* ]]; then sleep "${cmd#sleep:}"; continue; fi
+    if [[ $cmd == read:* ]]; then echo "char-read-hnd ${cmd#read:}" >&3; sleep 0.7; continue; fi
+    if [[ $cmd == h:* ]]; then
+      echo "char-write-req $HEALTH_HANDLE ${cmd#h:}" >&3; n=$((n + 1)); sleep 0.7; continue
+    fi
     [[ $cmd == settime ]] && cmd=$(settime_cmd)
     echo "char-write-req $WRITE_HANDLE $(pad "$cmd")" >&3
     n=$((n + 1))
@@ -65,15 +79,18 @@ attempt() {
   sleep 1.5
   echo exit >&3; exec 3>&-
   sleep 0.5; kill $GPID 2>/dev/null; wait $GPID 2>/dev/null
-  # +1 for the CCCD write
-  [[ $(clean "$log" | grep -c "written successfully") -ge $((n + 1)) ]]
+  # +2 for the CCCD writes
+  [[ $(clean "$log" | grep -c "written successfully") -ge $((n + 2)) ]]
 }
 
 send() {
   local r
   for ((r = 1; r <= RETRIES; r++)); do
     if attempt "$@"; then
-      clean "$WORK/log" | grep -o "value: .*" | sed 's/value: //'
+      # responses from 0af7 are printed bare, health data from 0af2 is prefixed with "af2:"
+      clean "$WORK/log" | grep -oE "handle = 0x00[0-9a-f]* value: .*|Characteristic value/descriptor: .*" |
+        sed -e 's/handle = 0x0010 value: //' -e 's/handle = 0x0013 value: /af2: /' \
+            -e 's|Characteristic value/descriptor: |read: |'
       return 0
     fi
     echo "attempt $r/$RETRIES failed, retrying..." >&2
@@ -94,6 +111,44 @@ case ${1:-} in
     send 0203 | response "02 03" | awk '{
       y = strtonum("0x"$4$3); printf "%04d-%02d-%02d %02d:%02d:%02d (weekday %d, Mon=0)\n",
       y, strtonum("0x"$5), strtonum("0x"$6), strtonum("0x"$7), strtonum("0x"$8), strtonum("0x"$9), strtonum("0x"$10) }' ;;
+  battery)
+    send 0205 | response "02 05" | awk '{
+      st = strtonum("0x"$6); split("normal charging full", names, " ")
+      printf "%d%%  %d mV  %s\n", strtonum("0x"$7), strtonum("0x"$5$4), (st + 1 in names) ? names[st + 1] : st }' ;;
+  live)
+    # 02 a0: steps, calories, distance, active time as u32 LE; byte 18 = last heart rate
+    send 02a0 | response "02 a0" | awk '{
+      for (k = 0; k < 4; k++) { i = 3 + 4 * k; v[k] = strtonum("0x"$(i+3)$(i+2)$(i+1)$i) }
+      printf "steps %d  calories %d  distance %d m  active %d min  heart rate %d\n",
+        v[0], v[1], v[2], v[3], strtonum("0x"$19) }' ;;
+  activity)
+    send h:0803010000 sleep:6 | grep "^af2: 08 03" | python3 -c '
+import sys, datetime
+pk = [bytes.fromhex(l.split(":", 1)[1].strip()) for l in sys.stdin]
+if len(pk) < 2:
+    sys.exit("no activity data")
+h = pk[0][4:]
+day = datetime.datetime(h[0] | h[1] << 8, h[2], h[3])
+step = h[6]
+t = pk[1][4:]
+u32 = lambda o: int.from_bytes(t[o:o + 4], "little")
+print(f"{day:%Y-%m-%d}: steps {u32(0)}  calories {u32(4)}  distance {u32(8)} m  active {u32(12)} min")
+slot = 0
+for p in pk[2:]:
+    d = p[4:]
+    for j in range(0, len(d) - 4, 5):
+        s = d[j:j + 5]
+        steps = (int.from_bytes(s[0:2], "little") >> 2) & 0xFFF
+        if steps:
+            active = (int.from_bytes(s[1:3], "little") >> 6) & 0xF
+            cal = (int.from_bytes(s[2:4], "little") >> 2) & 0x3FF
+            dist = int.from_bytes(s[3:5], "little") >> 4
+            ts = day + datetime.timedelta(minutes=slot * step)
+            print(f"  {ts:%H:%M}  steps {steps:5d}  calories {cal:4d}  distance {dist:5d} m  active {active} min")
+        slot += 1
+' ;;
+  find)
+    send 060400 "sleep:${2:-5}" 060401 ;;
   settime)
     send settime sleep:1 0203 | response "02 03" ;;
   vibrate)
@@ -107,5 +162,5 @@ case ${1:-} in
   raw)
     shift; send "$@" ;;
   *)
-    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

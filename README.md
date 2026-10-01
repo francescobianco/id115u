@@ -21,12 +21,19 @@ senza l'app ufficiale. Tutto quello che c'è qui è stato verificato su un dispo
 ./id115u notify Mario ciao  # notifica WhatsApp
 ./id115u time               # legge l'orologio del braccialetto
 ./id115u settime            # imposta l'orologio all'ora locale
+./id115u find               # vibrazione "trova dispositivo" per 5 s
+./id115u battery            # batteria: % , mV, stato
+./id115u live               # totali di oggi: passi, calorie, distanza, minuti attivi
+./id115u activity           # attività di oggi a intervalli di 15 minuti
 ./id115u info               # info dispositivo (risposta grezza)
 ./id115u mac                # legge il MAC
 ./id115u raw 0201           # comando grezzo (padding a 20 byte automatico)
+./id115u raw h:0803010000   # scrittura grezza sul canale salute 0af1
+./id115u raw read:0x0016    # lettura di una caratteristica
 ```
 
-Variabili d'ambiente: `MAC`, `RETRIES` (default 5), `CONNECT_TIMEOUT` in secondi (default 20).
+Variabili d'ambiente: `MAC`, `RETRIES` (default 5), `CONNECT_TIMEOUT` in secondi (default 20),
+`KEEP_LOG=<file>` per salvare il log grezzo di gatttool.
 
 Dipendenze: `gatttool` (bluez-deprecated), `xxd`, GNU `awk`.
 
@@ -58,30 +65,75 @@ Caratteristiche GATT (servizio `0af0`):
 |---|---|---|---|
 | `0af6` | `0x000e` | read, write | comandi |
 | `0af7` | `0x0010` | read, notify | risposte (CCCD `0x0011`, scrivere `0100`) |
-| `0af2` | `0x0013` | read, notify | – |
-| `0af1` | `0x0016` | read, write | – |
+| `0af1` | `0x0016` | read, write | richieste dati salute (scrittura senza padding) |
+| `0af2` | `0x0013` | read, notify | dati salute (CCCD `0x0014`, scrivere `0100`) |
 
-Ogni comando è lungo **20 byte** (padding con `00`). Il primo byte è la classe, il secondo
-il comando; la risposta arriva come notifica su `0af7` e ripete i primi due byte.
+Ogni comando su `0af6` è lungo **20 byte** (padding con `00`). Il primo byte è la classe, il
+secondo il comando; la risposta arriva come notifica su `0af7` e ripete i primi due byte.
+
+Classi: `01` OTA, `02` GET, `03` SET, `04` bind/unbind, `05` notifiche, `06` controllo app,
+`07` eventi dal braccialetto, `08` dati salute, `20` dump stack, `21` log, `aa` factory,
+`f0` riavvio/spegnimento.
 
 ### Comandi verificati
 
 | Comando | Byte | Risposta / effetto |
 |---|---|---|
-| Info dispositivo | `02 01` | `02 01 be 02 17 01 00 14 01 01` → id `0x02be`, fw 23 |
+| Info dispositivo | `02 01` | `02 01 <id LE 2B> <fw> <mode> <stato batt.> <batt. %> …` → es. `be 02 17 01 01 3a` = id `0x02be`, fw 23, in carica, 58% |
 | Funzioni supportate | `02 02` | `02 02 5b 0a 8f 01 07 6d 6b 05 0f 06 …` (bitmap, non decodificata) |
 | Lettura ora | `02 03` | `02 03 <anno LE 2B> <mese> <giorno> <ora> <min> <sec> <giorno sett.>` |
 | Lettura MAC | `02 04` | `02 04 e7 84 6b 69 a2 8a` |
-| ? | `02 05` | `02 05 00 77 0e 00 14 00 00 00 00 0d 06 00 00` |
+| Batteria | `02 05` | `02 05 <tipo> <mV LE 2B> <stato> <%> …` → es. `00 22 0f 00 3a` = 3874 mV, 58% |
 | ? | `02 06` | `02 06 ff ff …` |
+| Notifiche (readback) | `02 10` | `02 10 aa 00 00 aa 03 00` |
+| Dati live | `02 a0` | `02 a0 <passi u32> <calorie u32> <distanza m u32> <min attivi u32> <battito>` |
 | Imposta ora | `03 01 <anno LE 2B> <mese> <giorno> <ora> <min> <sec> <giorno sett.>` | orologio aggiornato |
 | Chiamata in arrivo | `05 01 01 01` | il braccialetto vibra |
 | Annulla chiamata | `05 02` | vibrazione interrotta |
 | Notifica messaggio | `05 03 <tot> <seq> <tipo> <len mittente> <len numero> <len testo> <mittente> <testo>` | notifica mostrata |
+| Trova dispositivo | `06 04 00` / `06 04 01` | avvia / ferma la vibrazione |
 
+Stato batteria: `0` normale, `1` in carica, `2` carica, `3` batteria scarica.
 Il giorno della settimana parte da **lunedì = 0**. Il tipo `0x08` è WhatsApp. In un singolo
 pacchetto mittente + numero + testo devono stare in 12 byte; testi più lunghi richiedono più
 pacchetti (`<tot>` / `<seq>`), non ancora provato.
+
+Tipi notifica (da Gadgetbridge): `01` generico/SMS, `03` WeChat, `06` Facebook, `07` Twitter,
+`08` WhatsApp, `09` Messenger, `0a` Instagram, `0b` LinkedIn.
+
+Tutti gli altri `02 xx` (da `00` a `ff`) non rispondono.
+
+### Dati salute (classe `08`, richiesta su `0af1`, risposte su `0af2`)
+
+Richiesta: `08 <key> 01 00 00` (5 byte, senza padding). La risposta è una serie di pacchetti
+`08 <key> <seq> <len> <payload…>` chiusa da `08 ee <tipo> 00 00 00`.
+
+| Key | Contenuto | Note |
+|---|---|---|
+| `01` | inizio sincronizzazione | risponde `08 01 00 00 00 00 00 00` |
+| `02` | fine sincronizzazione | risponde `08 02` |
+| `03` | attività di oggi | 34 pacchetti, vedi sotto |
+| `04` | sonno di oggi | vuoto (2 pacchetti) |
+| `05` | storico attività | vuoto |
+| `06` | storico sonno | vuoto |
+| `07`–`0a` | – | nessuna risposta |
+
+Attività di oggi (`08 03`):
+- pacchetto 1: `<anno LE 2B> <mese> <giorno> 00 00 <minuti per campione = 0f> <n. campioni = 60> <n. pacchetti = 22>`
+- pacchetto 2: totali `<passi u32> <calorie u32> <distanza u32> <min attivi u32>`
+- pacchetti successivi: campioni da 5 byte, 3 per pacchetto, uno ogni 15 minuti da mezzanotte.
+  Con `d01 = b0 | b1<<8` ecc.: passi `(d01 >> 2) & 0xfff`, minuti attivi `(d12 >> 6) & 0xf`,
+  calorie `(d23 >> 2) & 0x3ff`, distanza `d34 >> 4`.
+
+Il campo battito in `02 a0` vale 0: probabilmente questo modello non ha sensore di battito
+(non verificato). Non è stato trovato un comando per leggere l'accelerometro grezzo.
+
+## Fonti
+
+- [Gadgetbridge, supporto ID115](https://codeberg.org/Freeyourgadget/Gadgetbridge) (`devices/id115`, `service/devices/id115`):
+  costanti, fetch attività `08 03`, tipi di notifica.
+- [toobur-veryfit-research](https://github.com/d3nd3/toobur-veryfit-research) (`A200-PROTOCOL.md`):
+  protocollo IDO per un modello più recente; layout di `02 01`, `02 05`, `02 a0`, `06 04`.
 
 Esempio WhatsApp da "Claude" con testo "Ciao":
 
