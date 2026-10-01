@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Control an ID115U fitness band (IDO/VeryFit protocol) over BLE using gatttool.
+#
+# Usage:
+#   ./id115u info                     device info (02 01)
+#   ./id115u time                     read band clock (02 03)
+#   ./id115u settime                  set band clock to local time (03 01)
+#   ./id115u mac                      read MAC address (02 04)
+#   ./id115u vibrate [seconds]        incoming-call alert, cancelled after N s (default 4)
+#   ./id115u notify <from> <text>     WhatsApp notification (from+text <= 12 bytes)
+#   ./id115u raw <hex> [<hex>...]     write raw commands (padded to 20 bytes); "sleep:N" waits
+#
+# Env: MAC (default E7:84:6B:69:A2:8A), RETRIES (default 5), CONNECT_TIMEOUT (seconds, default 20)
+
+set -u
+
+MAC=${MAC:-E7:84:6B:69:A2:8A}
+RETRIES=${RETRIES:-5}
+CONNECT_TIMEOUT=${CONNECT_TIMEOUT:-20}
+
+WRITE_HANDLE=0x000e   # 0af6 write characteristic
+NOTIFY_CCCD=0x0011    # CCCD of 0af7 notify characteristic
+
+WORK=$(mktemp -d)
+trap 'kill $GPID 2>/dev/null; rm -rf "$WORK"' EXIT
+GPID=
+
+pad() { printf '%-40s' "$1" | tr ' ' 0; }
+hex() { printf '%s' "$1" | xxd -p | tr -d '\n'; }
+clean() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$1" | tr '\r' '\n'; }
+
+settime_cmd() {
+  local y m d H M S w
+  read -r y m d H M S w <<< "$(date '+%Y %m %d %H %M %S %u')"
+  # year little-endian, month, day, hour, min, sec, weekday (Monday=0)
+  pad "$(printf '0301%02x%02x%02x%02x%02x%02x%02x%02x' $((y & 255)) $((y >> 8)) \
+    $((10#$m)) $((10#$d)) $((10#$H)) $((10#$M)) $((10#$S)) $((w - 1)))"
+}
+
+# One attempt: connect, enable notifications, send commands. Returns 0 if all writes succeeded.
+attempt() {
+  local fifo=$WORK/in log=$WORK/log cmd n i
+  rm -f "$fifo"; mkfifo "$fifo"; : > "$log"
+  gatttool -t random -b "$MAC" -I < "$fifo" > "$log" 2>&1 &
+  GPID=$!
+  exec 3> "$fifo"
+  echo connect >&3
+  for ((i = 0; i < CONNECT_TIMEOUT * 2; i++)); do
+    grep -q "Connection successful" "$log" && break
+    sleep 0.5
+  done
+  if ! grep -q "Connection successful" "$log"; then
+    exec 3>&-; kill $GPID 2>/dev/null; wait $GPID 2>/dev/null
+    return 1
+  fi
+  echo "char-write-req $NOTIFY_CCCD 0100" >&3; sleep 0.5
+  n=0
+  for cmd in "$@"; do
+    if [[ $cmd == sleep:* ]]; then sleep "${cmd#sleep:}"; continue; fi
+    [[ $cmd == settime ]] && cmd=$(settime_cmd)
+    echo "char-write-req $WRITE_HANDLE $(pad "$cmd")" >&3
+    n=$((n + 1))
+    sleep 0.7
+  done
+  sleep 1.5
+  echo exit >&3; exec 3>&-
+  sleep 0.5; kill $GPID 2>/dev/null; wait $GPID 2>/dev/null
+  # +1 for the CCCD write
+  [[ $(clean "$log" | grep -c "written successfully") -ge $((n + 1)) ]]
+}
+
+send() {
+  local r
+  for ((r = 1; r <= RETRIES; r++)); do
+    if attempt "$@"; then
+      clean "$WORK/log" | grep -o "value: .*" | sed 's/value: //'
+      return 0
+    fi
+    echo "attempt $r/$RETRIES failed, retrying..." >&2
+  done
+  echo "giving up after $RETRIES attempts" >&2
+  return 1
+}
+
+# Find the response line for a given command prefix (e.g. "02 03").
+response() { grep -m1 "^$1" || true; }
+
+case ${1:-} in
+  info)
+    send 0201 | response "02 01" ;;
+  mac)
+    send 0204 | response "02 04" | awk '{print toupper($3":"$4":"$5":"$6":"$7":"$8)}' ;;
+  time)
+    send 0203 | response "02 03" | awk '{
+      y = strtonum("0x"$4$3); printf "%04d-%02d-%02d %02d:%02d:%02d (weekday %d, Mon=0)\n",
+      y, strtonum("0x"$5), strtonum("0x"$6), strtonum("0x"$7), strtonum("0x"$8), strtonum("0x"$9), strtonum("0x"$10) }' ;;
+  settime)
+    send settime sleep:1 0203 | response "02 03" ;;
+  vibrate)
+    send 05010101 "sleep:${2:-4}" 0502 ;;
+  notify)
+    [[ $# -eq 3 ]] || { echo "usage: $0 notify <from> <text>" >&2; exit 2; }
+    from=$(hex "$2"); text=$(hex "$3")
+    (( ${#from} / 2 + ${#text} / 2 <= 12 )) || { echo "from+text must be <= 12 bytes" >&2; exit 2; }
+    # 05 03 <total> <serial> <type 08=WhatsApp> <len from> <len number> <len text> <from> <text>
+    send "$(printf '0503010108%02x00%02x' $((${#from} / 2)) $((${#text} / 2)))$from$text" ;;
+  raw)
+    shift; send "$@" ;;
+  *)
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac
