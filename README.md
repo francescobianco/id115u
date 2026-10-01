@@ -22,6 +22,7 @@ senza l'app ufficiale. Tutto quello che c'è qui è stato verificato su un dispo
 ./id115u time               # legge l'orologio del braccialetto
 ./id115u settime            # imposta l'orologio all'ora locale
 ./id115u find               # vibrazione "trova dispositivo" per 5 s
+./id115u alarms             # programma le sveglie da alarms.txt
 ./id115u battery            # batteria: % , mV, stato
 ./id115u live               # totali di oggi: passi, calorie, distanza, minuti attivi
 ./id115u activity           # attività di oggi a intervalli di 15 minuti
@@ -92,6 +93,27 @@ Classi: `01` OTA, `02` GET, `03` SET, `04` bind/unbind, `05` notifiche, `06` con
 | Annulla chiamata | `05 02` | vibrazione interrotta |
 | Notifica messaggio | `05 03 <tot> <seq> <tipo> <len mittente> <len numero> <len testo> <mittente> <testo>` | notifica mostrata |
 | Trova dispositivo | `06 04 00` / `06 04 01` | avvia / ferma la vibrazione |
+| Sveglia | `03 02 <id> <stato> <tipo> <ora> <min> <ripetizione> <snooze>` | risponde `03 02` |
+
+### Sveglie
+
+Il braccialetto supporta **10 sveglie** (byte 1 della tabella funzioni `02 02` = `0x0a`).
+`./id115u alarms` usa gli slot 1–10 e disattiva anche lo slot 0.
+
+- **ripetizione**: bit 0 = attiva, bit 1…7 = lunedì…domenica (verificato: `0x11` = solo
+  giovedì suona di giovedì, `0x88` no). `0x00` = disattivata.
+- **stato**: `0x55` e `0xAA` suonano entrambi; lo script usa `0x55`.
+- **tipo** (icona): `00` sveglia; la tabella funzioni dichiara anche sonno, sport, medicina,
+  personalizzata (codici non verificati). Non è previsto un testo.
+
+La programmazione sta in `alarms.txt`, una riga per giorno:
+
+```
+MON 07:00 13:30
+FRI 07:00
+```
+
+Lo stesso orario in più giorni diventa una sola sveglia con più bit di ripetizione.
 
 Stato batteria: `0` normale, `1` in carica, `2` carica, `3` batteria scarica.
 Il giorno della settimana parte da **lunedì = 0**. Il tipo `0x08` è WhatsApp. In un singolo

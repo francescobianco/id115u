@@ -10,6 +10,7 @@
 #   ./id115u live                     today's totals: steps, calories, distance, active time (02 a0)
 #   ./id115u activity                 today's activity in 15-minute slots (08 03 on 0af1)
 #   ./id115u find [seconds]           "find device" vibration (06 04), stopped after N s (default 5)
+#   ./id115u alarms [file]            program alarms from a weekly matrix (default alarms.txt)
 #   ./id115u vibrate [seconds]        incoming-call alert, cancelled after N s (default 4)
 #   ./id115u notify <from> <text>     WhatsApp notification (from+text <= 12 bytes)
 #   ./id115u raw <hex> [<hex>...]     write raw commands (padded to 20 bytes); "sleep:N" waits,
@@ -149,6 +150,39 @@ for p in pk[2:]:
 ' ;;
   find)
     send 060400 "sleep:${2:-5}" 060401 ;;
+  alarms)
+    # 03 02 <id> <status 55> <type 00 = wake up> <hour> <min> <repeat> <snooze>
+    # repeat: bit 0 = enabled, bits 1..7 = Monday..Sunday
+    file=${2:-$(dirname "$0")/alarms.txt}
+    days=(MON TUE WED THU FRI SAT SUN)
+    declare -A mask=()
+    while read -r day times; do
+      [[ -z $day ]] && continue
+      idx=-1
+      for i in "${!days[@]}"; do [[ ${days[i]} == "${day^^}" ]] && idx=$i; done
+      (( idx >= 0 )) || { echo "unknown day: $day" >&2; exit 2; }
+      for t in $times; do
+        [[ $t =~ ^([01]?[0-9]|2[0-3]):([0-5][0-9])$ ]] || { echo "bad time: $t" >&2; exit 2; }
+        key=$(printf '%02d:%02d' $((10#${BASH_REMATCH[1]})) $((10#${BASH_REMATCH[2]})))
+        mask[$key]=$(( ${mask[$key]:-1} | 1 << (idx + 1) ))
+      done
+    done < <(sed 's/#.*//' "$file")
+    mapfile -t keys < <(printf '%s\n' "${!mask[@]}" | grep . | sort)
+    (( ${#keys[@]} <= 10 )) || { echo "too many distinct times: ${#keys[@]} (max 10)" >&2; exit 2; }
+    cmds=()
+    for ((slot = 0; slot <= 10; slot++)); do
+      if (( slot >= 1 && slot <= ${#keys[@]} )); then
+        k=${keys[slot - 1]}; m=${mask[$k]}
+        on=""; for i in "${!days[@]}"; do (( m >> (i + 1) & 1 )) && on+="${days[i]} "; done
+        echo "slot $slot: $k  $on"
+        cmds+=("$(printf '0302%02x5500%02x%02x%02x00' $slot $((10#${k%:*})) $((10#${k#*:})) $m)")
+      else
+        cmds+=("$(printf '0302%02x5500000000' $slot)")   # disabled
+      fi
+    done
+    acks=$(send "${cmds[@]}" | grep -c "^03 02")
+    echo "$acks/${#cmds[@]} slots written"
+    (( acks == ${#cmds[@]} )) ;;
   settime)
     send settime sleep:1 0203 | response "02 03" ;;
   vibrate)
@@ -162,5 +196,5 @@ for p in pk[2:]:
   raw)
     shift; send "$@" ;;
   *)
-    sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

@@ -1,0 +1,16 @@
+# Sveglie del braccialetto ID115U.
+# Una riga per giorno, seguita dagli orari (HH:MM) separati da spazi. Commenti con #.
+# Lo stesso orario in più giorni diventa una sola sveglia: massimo 10 orari diversi.
+# Applicare con: ./id115u alarms
+#
+# Esempio:
+#   MON 07:00 13:30
+#   FRI 07:00
+
+MON
+TUE
+WED
+THU
+FRI
+SAT
+SUN
